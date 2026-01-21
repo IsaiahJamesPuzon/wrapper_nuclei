@@ -965,7 +965,7 @@ class NucleiScanner:
         cmd = [
             self.nuclei_path,
             '-u', target,
-            '-json',
+            '-jsonl',
             '-silent',
             '-rate-limit', str(self.rate_limit),
             '-timeout', str(self.timeout),
