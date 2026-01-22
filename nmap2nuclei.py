@@ -1237,12 +1237,9 @@ class NucleiScanner:
                     protocol = 'https' if service.port in {443, 8443} else 'http'
                     target = f"{protocol}://{service.host}:{service.port}"
                 else:
-                    # Network scan - use protocol prefix
-                    net_protocol = EnhancedServiceMapper.get_network_protocol(
-                        service.port, 
-                        service.service
-                    )
-                    target = f"{net_protocol}{service.host}:{service.port}"
+                    # Network scan - Nuclei network templates require IP:PORT format (no protocol prefix)
+                    # Protocol is determined automatically by Nuclei based on the template
+                    target = f"{service.host}:{service.port}"
                 
                 # Detect technologies for logging
                 detected_techs = EnhancedServiceMapper.detect_technologies_from_service(service)
