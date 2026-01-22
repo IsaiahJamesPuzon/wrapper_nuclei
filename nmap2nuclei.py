@@ -1232,13 +1232,17 @@ class NucleiScanner:
                 if not templates:
                     continue
                 
-                # Build target
+                # Build target based on scan type
+                # HTTP templates require http:// or https:// prefix
+                # Network/javascript/dns templates use IP:PORT format (no protocol prefix)
+                # Nuclei automatically determines protocol from template type
                 if scan_type == 'http':
                     protocol = 'https' if service.port in {443, 8443} else 'http'
                     target = f"{protocol}://{service.host}:{service.port}"
                 else:
-                    # Network scan - Nuclei network templates require IP:PORT format (no protocol prefix)
-                    # Protocol is determined automatically by Nuclei based on the template
+                    # Network/javascript/dns templates: Use IP:PORT format
+                    # Based on testing: nuclei -u IP:PORT works for network templates
+                    # Protocol prefixes (tcp://, udp://, dns://) are NOT needed and may cause failures
                     target = f"{service.host}:{service.port}"
                 
                 # Detect technologies for logging
