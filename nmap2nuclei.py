@@ -13,9 +13,11 @@ Features:
 - Two-phase scanning (detection → comprehensive)
 - Zero irrelevant templates
 - Never misses generic vulnerabilities
+- CTEM-aligned severity, risk_score, and confidence calculations
+- Deduplication support via dedupe_key generation
 
 Author: Enhanced by Claude
-Version: 2.0
+Version: 2.1
 """
 
 import argparse
@@ -27,9 +29,11 @@ import sys
 import os
 import tempfile
 import shutil
+import hashlib
 from typing import List, Tuple, Dict, Optional, Set
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from enum import Enum
 
 # Configure logging
 logging.basicConfig(
@@ -37,6 +41,270 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# EXPOSURE CLASS AND SEVERITY MAPPING (aligned with CTEM transformers)
+# ============================================================
+class ExposureClass(str, Enum):
+    """Exposure classification aligned with ctem-ingester transformers."""
+    HTTP_CONTENT_LEAK = "http_content_leak"
+    VCS_PROTOCOL_EXPOSED = "vcs_protocol_exposed"
+    FILESHARE_EXPOSED = "fileshare_exposed"
+    REMOTE_ADMIN_EXPOSED = "remote_admin_exposed"
+    DB_EXPOSED = "db_exposed"
+    CONTAINER_API_EXPOSED = "container_api_exposed"
+    DEBUG_PORT_EXPOSED = "debug_port_exposed"
+    SERVICE_ADVERTISED_MDNS = "service_advertised_mdns"
+    EGRESS_TUNNEL_INDICATOR = "egress_tunnel_indicator"
+    MEDIA_STREAMING_EXPOSED = "media_streaming_exposed"
+    MONITORING_EXPOSED = "monitoring_exposed"
+    CACHE_EXPOSED = "cache_exposed"
+    QUEUE_EXPOSED = "queue_exposed"
+    UNKNOWN_SERVICE_EXPOSED = "unknown_service_exposed"
+
+
+# Severity mapping aligned with nmap_transformer.py and nuclei_transformer.py
+EXPOSURE_CLASS_SEVERITY_MAP = {
+    ExposureClass.DB_EXPOSED: 90,
+    ExposureClass.CONTAINER_API_EXPOSED: 85,
+    ExposureClass.QUEUE_EXPOSED: 80,
+    ExposureClass.CACHE_EXPOSED: 75,
+    ExposureClass.REMOTE_ADMIN_EXPOSED: 70,
+    ExposureClass.FILESHARE_EXPOSED: 65,
+    ExposureClass.DEBUG_PORT_EXPOSED: 60,
+    ExposureClass.VCS_PROTOCOL_EXPOSED: 55,
+    ExposureClass.HTTP_CONTENT_LEAK: 50,
+    ExposureClass.MONITORING_EXPOSED: 45,
+    ExposureClass.EGRESS_TUNNEL_INDICATOR: 45,
+    ExposureClass.SERVICE_ADVERTISED_MDNS: 40,
+    ExposureClass.MEDIA_STREAMING_EXPOSED: 35,
+    ExposureClass.UNKNOWN_SERVICE_EXPOSED: 30,
+}
+
+# Nuclei severity to score mapping (aligned with nuclei_transformer.py)
+NUCLEI_SEVERITY_MAP = {
+    'critical': 95,
+    'high': 80,
+    'medium': 60,
+    'low': 40,
+    'info': 20,
+    'unknown': 30
+}
+
+
+def classify_exposure_from_service(service: str, port: int, product: str = "") -> ExposureClass:
+    """
+    Classify exposure based on service/port (aligned with nmap_transformer._classify_exposure).
+    """
+    service_lower = service.lower() if service else ''
+    product_lower = product.lower() if product else ''
+    
+    # File sharing
+    if port in [137, 138, 139, 445, 548, 2049] or any(x in service_lower for x in ['smb', 'microsoft-ds', 'cifs', 'netbios-ssn', 'netbios-ns', 'netbios-dgm', 'nfs']):
+        return ExposureClass.FILESHARE_EXPOSED
+    
+    # Remote administration
+    if port == 22 or service_lower == 'ssh':
+        return ExposureClass.REMOTE_ADMIN_EXPOSED
+    if port == 3389 or service_lower in ['rdp', 'ms-wbt-server', 'ms-term-serv']:
+        return ExposureClass.REMOTE_ADMIN_EXPOSED
+    if port in [5900, 5901, 5902] or 'vnc' in service_lower:
+        return ExposureClass.REMOTE_ADMIN_EXPOSED
+    if port == 23 or service_lower == 'telnet':
+        return ExposureClass.REMOTE_ADMIN_EXPOSED
+    
+    # Container APIs
+    if port in [2375, 2376] or 'docker' in service_lower or 'docker' in product_lower:
+        return ExposureClass.CONTAINER_API_EXPOSED
+    if port == 6443 or 'kubernetes' in service_lower or 'k8s' in service_lower:
+        return ExposureClass.CONTAINER_API_EXPOSED
+    
+    # Databases
+    database_keywords = ['mysql', 'postgresql', 'postgres', 'mongodb', 
+                        'redis', 'mssql', 'oracle', 'cassandra', 
+                        'elasticsearch', 'couchdb', 'influxdb', 'mariadb']
+    if any(db in service_lower for db in database_keywords):
+        return ExposureClass.DB_EXPOSED
+    
+    unambiguous_db_ports = {3306, 5432, 27017, 6379, 1433, 1521, 5984}
+    if port in unambiguous_db_ports:
+        return ExposureClass.DB_EXPOSED
+    
+    # VCS protocols
+    if port == 9418 or service_lower == 'git':
+        return ExposureClass.VCS_PROTOCOL_EXPOSED
+    
+    # mDNS
+    if port == 5353 or 'mdns' in service_lower or 'bonjour' in service_lower:
+        return ExposureClass.SERVICE_ADVERTISED_MDNS
+    
+    # Media streaming
+    streaming_keywords = ['rtsp', 'airtunes', 'airplay', 'raop', 'streaming']
+    if any(kw in service_lower for kw in streaming_keywords):
+        return ExposureClass.MEDIA_STREAMING_EXPOSED
+    
+    # Monitoring
+    monitoring_keywords = ['prometheus', 'grafana', 'kibana', 'datadog', 'metrics', 'monitoring']
+    monitoring_ports = {3000, 3333, 5601, 9090, 9091, 9115, 16686}
+    if any(kw in service_lower or kw in product_lower for kw in monitoring_keywords) or port in monitoring_ports:
+        return ExposureClass.MONITORING_EXPOSED
+    
+    # Cache
+    cache_keywords = ['memcached', 'varnish', 'cache']
+    cache_ports = {11211, 11212}
+    if any(kw in service_lower or kw in product_lower for kw in cache_keywords) or port in cache_ports:
+        return ExposureClass.CACHE_EXPOSED
+    
+    # Message queues
+    queue_keywords = ['rabbitmq', 'kafka', 'activemq', 'zeromq', 'queue', 'amqp']
+    queue_ports = {5672, 9092, 61616, 25672}
+    if any(kw in service_lower or kw in product_lower for kw in queue_keywords) or port in queue_ports:
+        return ExposureClass.QUEUE_EXPOSED
+    
+    # HTTP services
+    http_ports = {80, 443, 8000, 8080, 8008, 8888, 8443, 9000, 9090, 3000, 4200, 5000}
+    if port in http_ports or 'http' in service_lower or 'www' in service_lower:
+        return ExposureClass.HTTP_CONTENT_LEAK
+    
+    # Debug ports
+    debug_ports = {9222, 6000, 63342, 5037, 9229, 5005, 4444, 9515, 50000, 5555, 5559, 1099}
+    if port in debug_ports or 'jenkins' in product_lower:
+        return ExposureClass.DEBUG_PORT_EXPOSED
+    
+    return ExposureClass.UNKNOWN_SERVICE_EXPOSED
+
+
+def calculate_severity_from_class(exposure_class: ExposureClass, product: str = "") -> int:
+    """Calculate severity score (0-100) based on exposure class."""
+    base_severity = EXPOSURE_CLASS_SEVERITY_MAP.get(exposure_class, 30)
+    
+    # Adjust for high-risk products (aligned with nmap_transformer)
+    if product:
+        product_lower = product.lower()
+        if any(keyword in product_lower for keyword in ['docker', 'kubernetes', 'jenkins']):
+            base_severity = min(base_severity + 10, 100)
+    
+    return base_severity
+
+
+def calculate_risk_score(
+    severity: int, 
+    exposure_class: ExposureClass,
+    is_private_ip: bool = True,
+    has_auth: bool = False
+) -> float:
+    """
+    Calculate risk score (0-100) based on severity and context.
+    
+    Risk Score = Base Severity × Context Multipliers
+    """
+    base_score = float(severity)
+    
+    # Public exposure multiplier
+    if not is_private_ip:
+        base_score *= 1.2  # 20% higher for public exposure
+    
+    # Authentication reduces risk
+    if has_auth:
+        base_score *= 0.8  # 20% lower if auth is required
+    
+    return min(base_score, 100.0)
+
+
+def calculate_confidence(
+    service_name: str,
+    port: int,
+    service_product: Optional[str] = None,
+    service_version: Optional[str] = None,
+    nuclei_severity: Optional[str] = None
+) -> float:
+    """
+    Calculate detection confidence (0-1) based on available data.
+    
+    High confidence: Service name + product + version + nuclei finding
+    Medium confidence: Service name + product OR well-known port
+    Low confidence: Only port detected or unknown service
+    """
+    confidence = 0.5  # Base confidence for port detection
+    
+    if service_name and service_name != 'unknown':
+        confidence += 0.15  # Service name identified
+    
+    if service_product:
+        confidence += 0.15  # Product identified
+    
+    if service_version:
+        confidence += 0.1  # Version identified
+    
+    # Nuclei finding boosts confidence
+    if nuclei_severity:
+        severity_boost = {
+            'critical': 0.15,
+            'high': 0.12,
+            'medium': 0.08,
+            'low': 0.05,
+            'info': 0.02
+        }
+        confidence += severity_boost.get(nuclei_severity.lower(), 0.02)
+    
+    # Well-known unambiguous ports boost confidence
+    unambiguous_ports = {
+        22: 'ssh', 3306: 'mysql', 5432: 'postgresql', 
+        3389: 'rdp', 445: 'smb', 27017: 'mongodb',
+        6379: 'redis', 80: 'http', 443: 'https'
+    }
+    if port in unambiguous_ports:
+        confidence += 0.05
+    
+    return min(confidence, 1.0)
+
+
+def generate_dedupe_key(
+    office_id: str,
+    asset_id: str,
+    dst_ip: str,
+    dst_port: int,
+    protocol: str,
+    exposure_class: str,
+    service_product: Optional[str] = None
+) -> str:
+    """
+    Generate deduplication key (aligned with ctem-ingester id_generation).
+    """
+    components = [
+        office_id,
+        asset_id,
+        dst_ip,
+        str(dst_port),
+        protocol,
+        exposure_class,
+        service_product or ''
+    ]
+    dedupe_string = '|'.join(components)
+    return hashlib.sha256(dedupe_string.encode()).hexdigest()
+
+
+def is_private_ip(ip: str) -> bool:
+    """Check if IP is in private (RFC 1918) ranges."""
+    try:
+        parts = ip.split('.')
+        if len(parts) != 4:
+            return False
+        first_octet = int(parts[0])
+        second_octet = int(parts[1])
+        # 10.0.0.0/8
+        if first_octet == 10:
+            return True
+        # 172.16.0.0/12
+        if first_octet == 172 and 16 <= second_octet <= 31:
+            return True
+        # 192.168.0.0/16
+        if first_octet == 192 and second_octet == 168:
+            return True
+        return False
+    except (ValueError, IndexError):
+        return False
 
 
 @dataclass
@@ -48,6 +316,29 @@ class ServiceInfo:
     product: str = ""
     version: str = ""
     protocol: str = "tcp"  # tcp, udp, ssl
+    mac: str = ""  # MAC address from nmap
+    hostname: str = ""  # Hostname from nmap
+    os: str = ""  # OS detection from nmap
+    exposure_class: Optional[ExposureClass] = None
+    severity: int = 30
+    risk_score: float = 30.0
+    confidence: float = 0.5
+    
+    def __post_init__(self):
+        """Calculate derived fields after initialization."""
+        if self.exposure_class is None:
+            self.exposure_class = classify_exposure_from_service(
+                self.service, self.port, self.product
+            )
+        self.severity = calculate_severity_from_class(self.exposure_class, self.product)
+        self.confidence = calculate_confidence(
+            self.service, self.port, self.product, self.version
+        )
+        self.risk_score = calculate_risk_score(
+            self.severity, 
+            self.exposure_class, 
+            is_private_ip(self.host)
+        )
 
 
 class EnhancedServiceMapper:
@@ -884,7 +1175,11 @@ class NucleiScanner:
             logger.error(f"Error verifying nuclei: {e}")
             sys.exit(1)
     
-    def scan_services(self, services: List[ServiceInfo]) -> Tuple[List[Dict], List[str]]:
+    def scan_services(
+        self, 
+        services: List[ServiceInfo],
+        office_id: str = "default"
+    ) -> Tuple[List[Dict], List[str]]:
         """
         Scan services with intelligent template selection.
         
@@ -895,9 +1190,28 @@ class NucleiScanner:
         templates_used = []
         
         logger.info(f"Scanning {len(services)} services...")
+        logger.info(f"Office ID: {office_id}")
+        
+        # Log service summary in verbose mode
+        if logger.level == logging.DEBUG:
+            logger.debug("=" * 60)
+            logger.debug("SERVICE DISCOVERY SUMMARY FROM NMAP")
+            logger.debug("=" * 60)
+            for svc in services:
+                exp_class = svc.exposure_class.value if svc.exposure_class else "unknown"
+                logger.debug(
+                    f"  {svc.host}:{svc.port} | {svc.service:15} | "
+                    f"class={exp_class:25} | severity={svc.severity:3} | "
+                    f"risk={svc.risk_score:.1f} | conf={svc.confidence:.2f}"
+                )
+            logger.debug("=" * 60)
         
         for service in services:
-            logger.info(f"Processing {service.host}:{service.port} [{service.service}]")
+            exp_class = service.exposure_class.value if service.exposure_class else "unknown"
+            logger.info(
+                f"Processing {service.host}:{service.port} [{service.service}] "
+                f"→ {exp_class} (severity={service.severity})"
+            )
             
             # Get templates for this service
             scans = EnhancedServiceMapper.get_templates_for_port(
@@ -934,13 +1248,41 @@ class NucleiScanner:
                 detected_techs = EnhancedServiceMapper.detect_technologies_from_service(service)
                 tech_str = f" [Detected: {', '.join(detected_techs)}]" if detected_techs else ""
                 
-                logger.info(f"  Scanning {target} [{scan_type.upper()}] with {len(templates)} template(s){tech_str}")
+                logger.info(
+                    f"  Scanning {target} [{scan_type.upper()}] with {len(templates)} template(s){tech_str}"
+                )
+                
+                # Log template mapping in verbose mode
+                if logger.level == logging.DEBUG:
+                    logger.debug(f"  Template mapping for {service.service}:{service.port}:")
+                    tier1_count = sum(1 for t in templates if 'exposures/' in t or 'misconfiguration/' in t or 'technologies/' in t)
+                    tier2_count = len(templates) - tier1_count
+                    logger.debug(f"    Tier 1 (generic): ~{tier1_count} templates")
+                    logger.debug(f"    Tier 2 (tech-specific): ~{tier2_count} templates")
+                    for t in templates[:5]:
+                        logger.debug(f"      - {t}")
+                    if len(templates) > 5:
+                        logger.debug(f"      ... and {len(templates) - 5} more")
                 
                 # Execute nuclei scan
-                findings = self._execute_nuclei(target, templates, scan_type, service)
+                findings = self._execute_nuclei(
+                    target, templates, scan_type, service, office_id
+                )
                 
                 if findings:
                     logger.info(f"  ✓ Found {len(findings)} result(s)")
+                    # Log finding details in verbose mode
+                    if logger.level == logging.DEBUG:
+                        for f in findings:
+                            f_severity = f.get('info', {}).get('severity', 'unknown')
+                            f_template = f.get('template-id', 'unknown')
+                            f_aligned_sev = f.get('severity', 'N/A')
+                            f_risk = f.get('risk_score', 'N/A')
+                            f_conf = f.get('confidence', 'N/A')
+                            logger.debug(
+                                f"    → {f_template} [{f_severity}] "
+                                f"(severity={f_aligned_sev}, risk={f_risk}, conf={f_conf})"
+                            )
                     all_findings.extend(findings)
                 
                 templates_used.extend(templates)
@@ -951,12 +1293,17 @@ class NucleiScanner:
                        target: str, 
                        templates: List[str], 
                        scan_type: str,
-                       service: ServiceInfo) -> List[Dict]:
+                       service: ServiceInfo,
+                       office_id: str = "default") -> List[Dict]:
         """Execute nuclei scan with given templates"""
         
         if self.dry_run:
             logger.info(f"[DRY RUN] Would scan: {target}")
             logger.info(f"[DRY RUN] Templates: {len(templates)}")
+            for t in templates[:5]:
+                logger.info(f"[DRY RUN]   - {t}")
+            if len(templates) > 5:
+                logger.info(f"[DRY RUN]   ... and {len(templates) - 5} more")
             return []
         
         findings = []
@@ -996,6 +1343,17 @@ class NucleiScanner:
             else:
                 cmd.extend(['-t', template])
         
+        # Log full command in verbose mode
+        if logger.level == logging.DEBUG:
+            cmd_str = ' '.join(cmd)
+            logger.debug(f"Executing nuclei command:")
+            logger.debug(f"  {cmd_str}")
+            logger.debug(f"  Templates ({len(templates)}):")
+            for t in templates[:10]:
+                logger.debug(f"    - {t}")
+            if len(templates) > 10:
+                logger.debug(f"    ... and {len(templates) - 10} more templates")
+        
         try:
             result = subprocess.run(
                 cmd,
@@ -1004,12 +1362,18 @@ class NucleiScanner:
                 timeout=300
             )
             
-            # Parse JSON output
+            # Parse JSON output and enrich with CTEM metadata
             for line in result.stdout.strip().split('\n'):
                 if line:
                     try:
                         finding = json.loads(line)
-                        findings.append(finding)
+                        
+                        # Enrich finding with CTEM metadata for proper ingestion
+                        enriched_finding = self._enrich_finding(
+                            finding, service, office_id
+                        )
+                        findings.append(enriched_finding)
+                        
                     except json.JSONDecodeError:
                         logger.debug(f"Failed to parse JSON: {line}")
             
@@ -1023,6 +1387,120 @@ class NucleiScanner:
         
         return findings
     
+    def _enrich_finding(
+        self, 
+        finding: Dict, 
+        service: ServiceInfo,
+        office_id: str
+    ) -> Dict:
+        """
+        Enrich nuclei finding with CTEM metadata for proper database ingestion.
+        
+        Adds:
+        - _ctem_enrichment: MAC, hostname, OS, exposure classification
+        - _service: Service info from nmap
+        - _ctem_severity: Aligned severity calculation
+        - _ctem_risk_score: Risk score calculation
+        - _ctem_confidence: Confidence calculation
+        - _ctem_dedupe_key: Deduplication key
+        """
+        # Get nuclei severity
+        info = finding.get('info', {})
+        nuclei_severity = info.get('severity', 'info')
+        
+        # Calculate aligned severity (max of nuclei severity and exposure class severity)
+        nuclei_score = NUCLEI_SEVERITY_MAP.get(nuclei_severity.lower(), 30)
+        class_score = EXPOSURE_CLASS_SEVERITY_MAP.get(service.exposure_class, 30)
+        aligned_severity = max(nuclei_score, class_score)
+        
+        # Calculate confidence with nuclei finding boost
+        confidence = calculate_confidence(
+            service.service,
+            service.port,
+            service.product,
+            service.version,
+            nuclei_severity
+        )
+        
+        # Calculate risk score
+        risk_score = calculate_risk_score(
+            aligned_severity,
+            service.exposure_class,
+            is_private_ip(service.host)
+        )
+        
+        # Generate asset ID (priority: MAC > Hostname > IP)
+        if service.mac:
+            asset_id = f"mac:{service.mac.lower().replace(':', '-')}"
+        elif service.hostname:
+            asset_id = f"host:{service.hostname.lower()}"
+        else:
+            asset_id = f"ip:{service.host}"
+        
+        # Generate dedupe key
+        dedupe_key = generate_dedupe_key(
+            office_id=office_id,
+            asset_id=asset_id,
+            dst_ip=service.host,
+            dst_port=service.port,
+            protocol=service.service,
+            exposure_class=service.exposure_class.value,
+            service_product=service.product
+        )
+        
+        # Add CTEM enrichment metadata (standardized field names for transformer consumption)
+        finding['_ctem_enrichment'] = {
+            'mac': service.mac or None,
+            'hostname': service.hostname or None,
+            'os': service.os or None,
+            'exposure_class': service.exposure_class.value,
+            'transport': service.protocol,
+            'resource_type': self._infer_resource_type(service.service, service.port),
+            'resource_identifier': f"{service.host}:{service.port}",
+            # Standardized scoring fields (used by nuclei_transformer if available)
+            'risk_score': round(risk_score, 2),
+            'confidence': round(confidence, 3),
+        }
+        
+        # Add service info
+        finding['_service'] = {
+            'service': service.service,
+            'product': service.product,
+            'version': service.version,
+            'port': service.port,
+            'protocol': service.protocol
+        }
+        
+        # Add top-level calculated values for easy access
+        finding['severity'] = aligned_severity  # Aligned severity (standardized)
+        finding['risk_score'] = round(risk_score, 2)  # Risk score (standardized)
+        finding['confidence'] = round(confidence, 3)  # Confidence (standardized)
+        finding['dedupe_key'] = dedupe_key  # Dedupe key (standardized)
+        finding['asset_id'] = asset_id
+        finding['office_id'] = office_id
+        
+        return finding
+    
+    def _infer_resource_type(self, service_name: str, port: int) -> Optional[str]:
+        """Infer resource type from service (aligned with nmap_transformer)."""
+        service_lower = service_name.lower() if service_name else ''
+        
+        if any(api in service_lower for api in ['api', 'rest', 'graphql', 'grpc']):
+            return 'api_endpoint'
+        if any(share in service_lower for share in ['smb', 'cifs']) or port in [445, 139]:
+            return 'smb_share'
+        if 'nfs' in service_lower or port == 2049:
+            return 'nfs_export'
+        if any(vcs in service_lower for vcs in ['git', 'svn', 'cvs']):
+            return 'repo'
+        if 'http' in service_lower or port in [80, 443, 8080, 8000, 8888]:
+            return 'http_path'
+        if port == 5353 or 'mdns' in service_lower:
+            return 'mdns_service'
+        if port == 53 or 'dns' in service_lower or 'domain' in service_lower:
+            return 'domain'
+        return None
+    
     def __del__(self):
         """Cleanup on deletion"""
         if self.port_substitution:
@@ -1030,7 +1508,16 @@ class NucleiScanner:
 
 
 def parse_nmap_xml(xml_file: str) -> List[ServiceInfo]:
-    """Parse nmap XML output and extract service information"""
+    """
+    Parse nmap XML output and extract service information.
+    
+    Enhanced to extract:
+    - IP address (v4 or v6)
+    - MAC address (for asset correlation)
+    - Hostname (DNS or NetBIOS)
+    - OS detection
+    - Full service info (name, product, version)
+    """
     
     services = []
     
@@ -1039,15 +1526,44 @@ def parse_nmap_xml(xml_file: str) -> List[ServiceInfo]:
         root = tree.getroot()
         
         for host in root.findall('.//host'):
-            # Get host address
-            addr_elem = host.find('.//address[@addrtype="ipv4"]')
-            if addr_elem is None:
-                addr_elem = host.find('.//address[@addrtype="ipv6"]')
+            # Get host addresses (IP and MAC)
+            host_addr = None
+            mac_addr = None
             
-            if addr_elem is None:
+            for addr_elem in host.findall('.//address'):
+                addr_type = addr_elem.get('addrtype')
+                if addr_type == 'ipv4' and not host_addr:
+                    host_addr = addr_elem.get('addr')
+                elif addr_type == 'ipv6' and not host_addr:
+                    host_addr = addr_elem.get('addr')
+                elif addr_type == 'mac':
+                    mac_addr = addr_elem.get('addr')
+            
+            if host_addr is None:
                 continue
             
-            host_addr = addr_elem.get('addr')
+            # Get hostname (DNS)
+            hostname = None
+            hostnames = host.findall('.//hostname')
+            if hostnames:
+                hostname = hostnames[0].get('name')
+            
+            # Fallback: try to get NetBIOS name from nbstat script
+            if not hostname:
+                nbstat_script = host.find('.//hostscript/script[@id="nbstat"]')
+                if nbstat_script is not None:
+                    output = nbstat_script.get('output', '')
+                    if 'NetBIOS name: ' in output:
+                        start = output.find('NetBIOS name: ') + len('NetBIOS name: ')
+                        end = output.find(',', start)
+                        if end != -1:
+                            hostname = output[start:end].strip()
+            
+            # Get OS detection
+            os_name = None
+            os_elem = host.find('.//os/osmatch')
+            if os_elem is not None:
+                os_name = os_elem.get('name')
             
             # Get all open ports
             for port in host.findall('.//port'):
@@ -1061,7 +1577,7 @@ def parse_nmap_xml(xml_file: str) -> List[ServiceInfo]:
                 # Get service info
                 service_elem = port.find('service')
                 if service_elem is not None:
-                    service_name = service_elem.get('name', '')
+                    service_name = service_elem.get('name', 'unknown')
                     product = service_elem.get('product', '')
                     version = service_elem.get('version', '')
                 else:
@@ -1069,16 +1585,36 @@ def parse_nmap_xml(xml_file: str) -> List[ServiceInfo]:
                     product = ''
                     version = ''
                 
+                # Create ServiceInfo with all metadata
+                # exposure_class, severity, risk_score, confidence are auto-calculated
                 services.append(ServiceInfo(
                     host=host_addr,
                     port=port_id,
                     service=service_name,
                     product=product,
                     version=version,
-                    protocol=protocol
+                    protocol=protocol,
+                    mac=mac_addr or '',
+                    hostname=hostname or '',
+                    os=os_name or ''
                 ))
         
         logger.info(f"Parsed {len(services)} services from {xml_file}")
+        
+        # Log asset summary
+        unique_hosts = set((s.host, s.mac, s.hostname) for s in services)
+        logger.info(f"  Unique hosts: {len(unique_hosts)}")
+        
+        # Log exposure class distribution
+        class_counts = {}
+        for s in services:
+            class_name = s.exposure_class.value if s.exposure_class else "unknown"
+            class_counts[class_name] = class_counts.get(class_name, 0) + 1
+        
+        if logger.level == logging.DEBUG:
+            logger.debug("Exposure class distribution:")
+            for cls, count in sorted(class_counts.items(), key=lambda x: -x[1]):
+                logger.debug(f"    {cls}: {count}")
         
     except ET.ParseError as e:
         logger.error(f"Error parsing XML file: {e}")
@@ -1121,32 +1657,58 @@ def parse_force_target(target_str: str, service_hint: Optional[str] = None) -> S
     else:
         service = 'unknown'
     
+    # ServiceInfo auto-calculates exposure_class, severity, risk_score, confidence
     return ServiceInfo(
         host=host,
         port=port,
         service=service,
-        protocol=protocol
+        protocol=protocol,
+        mac='',
+        hostname='',
+        os=''
     )
 
 
 def save_results(findings: List[Dict], output_file: str):
-    """Save findings to JSON file"""
+    """
+    Save findings to JSON file with CTEM enrichment metadata.
+    
+    The output file contains:
+    - Standard nuclei finding fields
+    - _ctem_enrichment: MAC, hostname, OS, exposure classification
+    - _service: Service info from nmap
+    - _ctem_severity: Aligned severity calculation (0-100)
+    - _ctem_risk_score: Risk score calculation (0-100)
+    - _ctem_confidence: Confidence score (0-1)
+    - _ctem_dedupe_key: Deduplication key for database upsert
+    """
     try:
         with open(output_file, 'w') as f:
             json.dump(findings, f, indent=2)
         logger.info(f"Results saved to: {output_file}")
+        logger.info(f"  Total findings: {len(findings)}")
+        
+        # Count unique dedupe keys
+        dedupe_keys = set(f.get('_ctem_dedupe_key', '') for f in findings)
+        logger.info(f"  Unique dedupe keys: {len(dedupe_keys)} (for database deduplication)")
+        
+        if len(findings) > len(dedupe_keys):
+            logger.info(f"  Note: {len(findings) - len(dedupe_keys)} findings will be deduplicated on ingestion")
     except Exception as e:
         logger.error(f"Error saving results: {e}")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Enhanced nmap2nuclei - Intelligent Nuclei Template Scanner',
+        description='Enhanced nmap2nuclei - Intelligent Nuclei Template Scanner with CTEM Integration',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   # Basic scan with intelligent template selection
   %(prog)s -i scan.xml
+  
+  # Verbose scan showing commands and template mapping
+  %(prog)s -i scan.xml -v
   
   # Fast scan (Tier 1 only - no technology-specific templates)
   %(prog)s -i scan.xml --no-tier2
@@ -1159,6 +1721,9 @@ Examples:
   
   # With port substitution
   %(prog)s -i scan.xml --enable-port-substitution
+  
+  # Comprehensive scan with office ID for CTEM ingestion
+  %(prog)s -i scan.xml --office-id office-001 -o findings.json -v
   
   # Comprehensive scan
   %(prog)s -i scan.xml --cve --enable-port-substitution --templates-dir /opt/nuclei-templates
@@ -1182,6 +1747,11 @@ Examples:
     parser.add_argument('--enable-port-substitution',
                        action='store_true',
                        help='Enable dynamic port substitution in templates')
+    
+    # CTEM options
+    parser.add_argument('--office-id',
+                       default='default',
+                       help='Office ID for CTEM ingestion (default: default)')
     
     # CVE options
     parser.add_argument('--cve',
@@ -1212,7 +1782,7 @@ Examples:
                        help='Output JSON file for findings')
     parser.add_argument('-v', '--verbose',
                        action='store_true',
-                       help='Verbose output')
+                       help='Verbose output (shows nuclei commands, template mapping, CTEM metrics)')
     parser.add_argument('--dry-run',
                        action='store_true',
                        help='Dry run - show what would be scanned without executing')
@@ -1232,13 +1802,18 @@ Examples:
         for target in args.force_target:
             service_info = parse_force_target(target, args.service)
             services.append(service_info)
-            logger.info(f"Force target: {service_info.host}:{service_info.port} [{service_info.service}]")
+            exp_class = service_info.exposure_class.value if service_info.exposure_class else "unknown"
+            logger.info(
+                f"Force target: {service_info.host}:{service_info.port} "
+                f"[{service_info.service}] → {exp_class}"
+            )
     
     if not services:
         logger.error("No services to scan")
         sys.exit(1)
     
     logger.info(f"Found {len(services)} service(s) to scan")
+    logger.info(f"Office ID: {args.office_id}")
     
     # Initialize scanner
     scanner = NucleiScanner(
@@ -1252,18 +1827,19 @@ Examples:
     )
     
     # Run scans
-    findings, templates_used = scanner.scan_services(services)
+    findings, templates_used = scanner.scan_services(services, args.office_id)
     
     # Print summary
     logger.info("")
     logger.info("=" * 60)
     logger.info("SCAN SUMMARY")
     logger.info("=" * 60)
+    logger.info(f"Office ID: {args.office_id}")
     logger.info(f"Services scanned: {len(services)}")
     logger.info(f"Unique templates used: {len(set(templates_used))}")
     logger.info(f"Total findings: {len(findings)}")
     
-    # Count by severity
+    # Count by nuclei severity
     severity_counts = {}
     for finding in findings:
         severity = finding.get('info', {}).get('severity', 'unknown')
@@ -1271,25 +1847,74 @@ Examples:
     
     if severity_counts:
         logger.info("")
-        logger.info("Findings by severity:")
+        logger.info("Findings by Nuclei severity:")
         for severity in ['critical', 'high', 'medium', 'low', 'info', 'unknown']:
             if severity in severity_counts:
                 logger.info(f"  {severity.upper()}: {severity_counts[severity]}")
+    
+    # Count by CTEM exposure class
+    class_counts = {}
+    for finding in findings:
+        exp_class = finding.get('_ctem_enrichment', {}).get('exposure_class', 'unknown')
+        class_counts[exp_class] = class_counts.get(exp_class, 0) + 1
+    
+    if class_counts:
+        logger.info("")
+        logger.info("Findings by CTEM exposure class:")
+        for cls, count in sorted(class_counts.items(), key=lambda x: -x[1]):
+            class_severity = EXPOSURE_CLASS_SEVERITY_MAP.get(
+                ExposureClass(cls) if cls != 'unknown' else ExposureClass.UNKNOWN_SERVICE_EXPOSED, 
+                30
+            )
+            logger.info(f"  {cls}: {count} (base_severity={class_severity})")
+    
+    # Scoring metrics summary
+    if findings:
+        logger.info("")
+        logger.info("Scoring Metrics Summary:")
+        severities = [f.get('severity', 0) for f in findings]
+        risks = [f.get('risk_score', 0) for f in findings]
+        confs = [f.get('confidence', 0) for f in findings]
+        
+        if severities:
+            logger.info(f"  Severity: min={min(severities)}, max={max(severities)}, avg={sum(severities)/len(severities):.1f}")
+        if risks:
+            logger.info(f"  Risk Score: min={min(risks):.1f}, max={max(risks):.1f}, avg={sum(risks)/len(risks):.1f}")
+        if confs:
+            logger.info(f"  Confidence: min={min(confs):.2f}, max={max(confs):.2f}, avg={sum(confs)/len(confs):.2f}")
+        
+        # Count unique dedupe keys
+        dedupe_keys = set(f.get('dedupe_key', '') for f in findings)
+        logger.info(f"  Unique dedupe keys: {len(dedupe_keys)}")
     
     # Save results
     if args.output:
         save_results(findings, args.output)
     
-    # Print findings
+    # Print detailed findings in verbose mode
     if findings and args.verbose:
         logger.info("")
         logger.info("=" * 60)
-        logger.info("FINDINGS")
+        logger.info("DETAILED FINDINGS")
         logger.info("=" * 60)
         for finding in findings:
-            logger.info(f"\n{finding.get('template-id', 'unknown')}")
-            logger.info(f"  Severity: {finding.get('info', {}).get('severity', 'unknown')}")
-            logger.info(f"  Matched: {finding.get('matched-at', 'N/A')}")
+            template_id = finding.get('template-id', 'unknown')
+            nuclei_sev = finding.get('info', {}).get('severity', 'unknown')
+            matched = finding.get('matched-at', 'N/A')
+            ctem_sev = finding.get('_ctem_severity', 'N/A')
+            risk = finding.get('_ctem_risk_score', 'N/A')
+            conf = finding.get('_ctem_confidence', 'N/A')
+            exp_class = finding.get('_ctem_enrichment', {}).get('exposure_class', 'unknown')
+            dedupe = finding.get('_ctem_dedupe_key', 'N/A')[:16] + '...'
+            
+            logger.info(f"\n{template_id}")
+            logger.info(f"  Matched: {matched}")
+            logger.info(f"  Nuclei Severity: {nuclei_sev}")
+            logger.info(f"  CTEM Exposure Class: {exp_class}")
+            logger.info(f"  CTEM Aligned Severity: {ctem_sev}")
+            logger.info(f"  CTEM Risk Score: {risk}")
+            logger.info(f"  CTEM Confidence: {conf}")
+            logger.info(f"  Dedupe Key: {dedupe}")
 
 
 if __name__ == '__main__':
